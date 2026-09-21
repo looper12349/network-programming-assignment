@@ -156,6 +156,11 @@ class ByteStream:
         while True:
             idx = self.buf.find(delim, search_from)
             if idx != -1:
+                # Check the limit against what we found, not against what has
+                # arrived. One recv() can deliver 64 KiB, and a limit that
+                # only fires when the peer sends slowly is not a limit.
+                if idx + len(delim) > limit:
+                    raise too_big
                 out = bytes(self.buf[:idx])
                 del self.buf[: idx + len(delim)]
                 return out
