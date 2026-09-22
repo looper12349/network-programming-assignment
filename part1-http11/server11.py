@@ -318,12 +318,46 @@ def body_length(method: str, version: str,
     return ("none", 0)
 
 
+def read_chunked(stream: ByteStream) -> bytes:
+    """Decode a chunked body.
+
+    Same question as Content-Length, asked once per chunk: the size line
+    says how many bytes belong to this chunk, and the two bytes after them
+    are the chunk's own CRLF, not data. A zero-size chunk ends the body,
+    and any trailer fields after it still have to be consumed - they are
+    part of this message, so leaving them in the buffer desynchronises the
+    next request just as surely as a short read would.
+    """
+    body = bytearray()
+    too_big = HttpError(400, "chunk size line too long", fatal=True)
+    while True:
+        line = stream.read_until(b"\r\n", 1024, too_big)
+        size_field = line.split(b";", 1)[0].strip()  # ignore chunk extensions
+        if not size_field or any(c not in b"0123456789abcdefABCDEF"
+                                 for c in size_field):
+            raise HttpError(400, "malformed chunk size", fatal=True)
+        size = int(size_field, 16)
+        if len(body) + size > MAX_BODY_BYTES:
+            raise HttpError(413, "chunked body too large", fatal=True)
+        if size == 0:
+            break
+        body += stream.read_exactly(size)
+        if stream.read_exactly(2) != b"\r\n":
+            raise HttpError(400, "chunk not terminated by CRLF", fatal=True)
+
+    # trailer section, terminated by an empty line
+    for _ in range(MAX_HEADER_COUNT + 1):
+        if stream.read_until(b"\r\n", MAX_HEAD_BYTES, too_big) == b"":
+            return bytes(body)
+    raise HttpError(400, "too many trailer fields", fatal=True)
+
+
 def read_body(stream: ByteStream, framing: str, length: int) -> bytes:
     if framing == "none":
         return b""
     if framing == "length":
         return stream.read_exactly(length)
-    raise HttpError(501, "chunked bodies not implemented", fatal=True)
+    return read_chunked(stream)
 
 
 # --------------------------------------------------------------------------

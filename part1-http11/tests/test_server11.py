@@ -203,6 +203,24 @@ class FramingTests(ServerFixture):
         # 42, not 81: the smuggled request was body, not request.
         self.assertEqual(out[1][2].strip(), b"42")
 
+    def test_chunked_body_is_decoded_and_the_stream_stays_aligned(self):
+        chunked = (b"POST /add HTTP/1.1\r\nHost: localhost\r\n"
+                   b"Transfer-Encoding: chunked\r\n\r\n"
+                   b"4\r\nab=1\r\n"
+                   b"5;ext=1\r\n&b=22\r\n"
+                   b"0\r\nX-Trailer: ignored\r\n\r\n")
+        follow = b"GET /add?a=20&b=22 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        _, _, out = self.exchange(chunked + follow, count=2)
+        self.assertEqual(out[0][0], 405)
+        self.assertEqual(out[1][0], 200)
+        self.assertEqual(out[1][2].strip(), b"42")
+
+    def test_malformed_chunk_size_is_rejected(self):
+        raw = (b"POST /add HTTP/1.1\r\nHost: localhost\r\n"
+               b"Transfer-Encoding: chunked\r\n\r\nzz\r\n")
+        _, _, out = self.exchange(raw)
+        self.assertEqual(out[0][0], 400)
+
     def test_request_split_across_packets(self):
         sock = self.connect()
         for piece in [b"GET /ad", b"d?a=2&b", b"=3 HTTP/1.1\r\nHo",
