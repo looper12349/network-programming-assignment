@@ -1,0 +1,509 @@
+#!/usr/bin/env python3
+"""bserve - a BHTTP/1 file server.
+
+    ./bserve ./www 9000
+
+Accepts a TCP connection, reads the preface, then reads binary request
+frames until the peer goes away. Maps the path to a file under a root,
+replies with status, headers and the bytes, and keeps the connection open.
+
+This file implements SPEC.md and shares no code with ./bcurl. That is
+deliberate: a client that only works against its own server's encoder is an
+implementation, not a protocol. The two halves were written from the
+document, and the interop tests are what prove the document was enough.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import socket
+import sys
+import threading
+import time
+from typing import Dict, List, Optional, Tuple
+
+# ---------------------------------------------------------------------------
+# SPEC.md section 2-5: constants
+# ---------------------------------------------------------------------------
+
+PREFACE = b"BHTTP/1\x00"
+HEADER_SIZE = 8
+
+T_REQUEST, T_RESPONSE, T_DATA, T_ERROR, T_PING = 0x01, 0x02, 0x03, 0x04, 0x05
+F_END_MESSAGE, F_ACK = 0x01, 0x02
+
+E_PROTOCOL, E_FRAME_TOO_LARGE, E_BAD_PREFACE, E_INTERNAL = 1, 2, 3, 4
+
+MAX_PAYLOAD = 1024 * 1024
+MAX_PATH = 8192
+MAX_HEADER_ENTRIES = 64
+MAX_PING = 64
+DATA_CHUNK = 16384
+
+STATIC_NAMES = ["host", "user-agent", "accept", "content-type", "content-length",
+                "date", "server", "connection", "last-modified", "etag"]
+NAME_TO_INDEX = {name: i + 1 for i, name in enumerate(STATIC_NAMES)}
+
+METHODS = {1: "GET", 2: "HEAD", 3: "POST", 4: "PUT", 5: "DELETE", 6: "OPTIONS"}
+
+CONTENT_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".htm": "text/html; charset=utf-8",
+    ".txt": "text/plain; charset=utf-8",
+    ".md": "text/markdown; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".js": "application/javascript",
+    ".json": "application/json",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".gif": "image/gif",
+    ".bin": "application/octet-stream",
+}
+
+SERVER_ID = "bserve/1.0"
+
+
+class StreamError(Exception):
+    """Answerable with a RESPONSE; the connection survives (SPEC 9.1)."""
+
+    def __init__(self, status: int, detail: str,
+                 headers: Optional[List[Tuple[str, str]]] = None) -> None:
+        super().__init__(f"{status} {detail}")
+        self.status = status
+        self.detail = detail
+        self.headers = headers or []
+
+
+class ConnectionError_(Exception):
+    """Unrecoverable; send ERROR and close (SPEC 9.2)."""
+
+    def __init__(self, code: int, reason: str) -> None:
+        super().__init__(f"{code} {reason}")
+        self.code = code
+        self.reason = reason
+
+
+class Gone(Exception):
+    """Peer closed."""
+
+
+# ---------------------------------------------------------------------------
+# decoding
+# ---------------------------------------------------------------------------
+
+
+class Reader:
+    """Exact reads off a socket. Nothing here guesses at a boundary."""
+
+    def __init__(self, sock: socket.socket) -> None:
+        self.sock = sock
+        self.buf = bytearray()
+
+    def exact(self, n: int) -> bytes:
+        while len(self.buf) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise Gone()
+            self.buf += chunk
+        out = bytes(self.buf[:n])
+        del self.buf[:n]
+        return out
+
+
+class Cursor:
+    """Walks a decoded payload. Every read is bounds-checked, because the
+    length prefix is the only reason we know where anything ends."""
+
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+        self.pos = 0
+
+    def take(self, n: int) -> bytes:
+        if n < 0 or self.pos + n > len(self.data):
+            raise StreamError(400, "payload ends inside a field")
+        out = self.data[self.pos : self.pos + n]
+        self.pos += n
+        return out
+
+    def u8(self) -> int:
+        return self.take(1)[0]
+
+    def u16(self) -> int:
+        b = self.take(2)
+        return (b[0] << 8) | b[1]
+
+    def at_end(self) -> bool:
+        return self.pos == len(self.data)
+
+
+def parse_frame_header(raw: bytes) -> Tuple[int, int, int, int]:
+    """8 octets -> (length, type, flags, stream). SPEC 3."""
+    length = (raw[0] << 16) | (raw[1] << 8) | raw[2]
+    ftype = raw[3]
+    flags = raw[4]
+    # Top bit of octet 5 is R. Masked off and never inspected: SPEC 3 makes
+    # ignoring it a requirement on the receiver, and a bit somebody validates
+    # is a bit nobody can ever use.
+    stream = ((raw[5] & 0x7F) << 16) | (raw[6] << 8) | raw[7]
+    return length, ftype, flags, stream
+
+
+def decode_header_block(cur: Cursor) -> List[Tuple[str, str]]:
+    """SPEC 6."""
+    count = cur.u8()
+    if count > MAX_HEADER_ENTRIES:
+        raise StreamError(400, f"header block has {count} entries")
+    fields: List[Tuple[str, str]] = []
+    for _ in range(count):
+        ref = cur.u8()
+        if ref == 0:
+            name = cur.take(cur.u8())
+            if not name:
+                raise StreamError(400, "empty literal header name")
+            if any(0x41 <= b <= 0x5A for b in name):
+                raise StreamError(400, "literal header name must be lowercase")
+            field = name.decode("ascii", "replace")
+        elif 1 <= ref <= len(STATIC_NAMES):
+            field = STATIC_NAMES[ref - 1]
+        else:
+            # Parseable but not intelligible. SPEC 6.1: refuse, do not guess.
+            raise StreamError(400, f"unknown static header index {ref}")
+        value = cur.take(cur.u16())
+        fields.append((field, value.decode("utf-8", "replace")))
+    return fields
+
+
+def decode_request(payload: bytes) -> Tuple[str, str, List[Tuple[str, str]]]:
+    """SPEC 7.1."""
+    cur = Cursor(payload)
+    code = cur.u8()
+    if code == 0:
+        method = cur.take(cur.u8()).decode("ascii", "replace")
+        if not method:
+            raise StreamError(400, "empty literal method")
+    elif code in METHODS:
+        method = METHODS[code]
+    else:
+        raise StreamError(501, f"unknown method code {code}")
+
+    path_len = cur.u16()
+    if path_len == 0 or path_len > MAX_PATH:
+        raise StreamError(400, "path length out of range")
+    path = cur.take(path_len).decode("utf-8", "replace")
+    if not path.startswith("/"):
+        raise StreamError(400, "path must be in origin-form")
+
+    fields = decode_header_block(cur)
+    if not cur.at_end():
+        raise StreamError(400, "trailing octets after header block")
+    return method, path, fields
+
+
+# ---------------------------------------------------------------------------
+# encoding
+# ---------------------------------------------------------------------------
+
+
+def frame(ftype: int, flags: int, stream: int, payload: bytes) -> bytes:
+    if len(payload) > 0xFFFFFF:
+        raise ValueError("payload exceeds the 24-bit length field")
+    n = len(payload)
+    head = bytes((
+        (n >> 16) & 0xFF, (n >> 8) & 0xFF, n & 0xFF,
+        ftype & 0xFF,
+        flags & 0xFF,
+        (stream >> 16) & 0x7F, (stream >> 8) & 0xFF, stream & 0xFF,
+    ))
+    return head + payload
+
+
+def encode_header_block(fields: List[Tuple[str, str]]) -> bytes:
+    out = bytearray([len(fields)])
+    for name, value in fields:
+        lname = name.lower()
+        index = NAME_TO_INDEX.get(lname, 0)
+        out.append(index)
+        if index == 0:
+            raw_name = lname.encode("ascii")
+            out.append(len(raw_name))
+            out += raw_name
+        raw_value = value.encode("utf-8")
+        out += bytes(((len(raw_value) >> 8) & 0xFF, len(raw_value) & 0xFF))
+        out += raw_value
+    return bytes(out)
+
+
+def encode_response(status: int, fields: List[Tuple[str, str]]) -> bytes:
+    return bytes(((status >> 8) & 0xFF, status & 0xFF)) + encode_header_block(fields)
+
+
+def encode_error(code: int, reason: str) -> bytes:
+    raw = reason.encode("utf-8")[:512]
+    return bytes(((code >> 8) & 0xFF, code & 0xFF,
+                  (len(raw) >> 8) & 0xFF, len(raw) & 0xFF)) + raw
+
+
+def http_date(when: Optional[float] = None) -> str:
+    t = time.gmtime(when if when is not None else time.time())
+    days = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+    months = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+              "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+    return "%s, %02d %s %04d %02d:%02d:%02d GMT" % (
+        days[t.tm_wday], t.tm_mday, months[t.tm_mon - 1], t.tm_year,
+        t.tm_hour, t.tm_min, t.tm_sec)
+
+
+# ---------------------------------------------------------------------------
+# resource resolution
+# ---------------------------------------------------------------------------
+
+
+def resolve(root: str, path: str) -> str:
+    target = path.split("?", 1)[0].split("#", 1)[0]
+    if "\x00" in target:
+        raise StreamError(400, "NUL in path")
+    if target.endswith("/"):
+        target += "index.html"
+
+    # Normalise first, then prove containment. Never check for ".." in the
+    # raw string: "/a/..%2f.." and friends are why that check keeps failing
+    # in real servers.
+    candidate = os.path.normpath(os.path.join(root, target.lstrip("/")))
+    root_abs = os.path.realpath(root)
+    candidate_abs = os.path.realpath(candidate)
+    if candidate_abs != root_abs and not candidate_abs.startswith(root_abs + os.sep):
+        raise StreamError(404, "no such resource")
+    if os.path.isdir(candidate_abs):
+        candidate_abs = os.path.join(candidate_abs, "index.html")
+    if not os.path.isfile(candidate_abs):
+        raise StreamError(404, "no such resource")
+    return candidate_abs
+
+
+# ---------------------------------------------------------------------------
+# connection handling
+# ---------------------------------------------------------------------------
+
+
+class BServe:
+    def __init__(self, root: str, host: str, port: int, *,
+                 verbose: bool = True) -> None:
+        self.root = os.path.realpath(root)
+        self.host = host
+        self.port = port
+        self.verbose = verbose
+        self.sock: Optional[socket.socket] = None
+        self.connections = 0
+        self.requests = 0
+        self.skipped_unknown = 0
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+
+    def log(self, *args) -> None:
+        if self.verbose:
+            print(*args, file=sys.stderr, flush=True)
+
+    def listen(self) -> int:
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind((self.host, self.port))
+        self.sock.listen(64)
+        self.port = self.sock.getsockname()[1]
+        return self.port
+
+    def serve_forever(self) -> None:
+        assert self.sock is not None
+        self.log(f"bserve serving {self.root} on {self.host}:{self.port}")
+        self.sock.settimeout(0.5)
+        while not self._stop.is_set():
+            try:
+                conn, peer = self.sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            with self._lock:
+                self.connections += 1
+                number = self.connections
+            threading.Thread(target=self._guard, args=(conn, peer, number),
+                             daemon=True).start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+
+    def _guard(self, conn, peer, number) -> None:
+        try:
+            self.handle(conn, peer, number)
+        except Exception as exc:
+            self.log(f"[conn {number}] internal error: {exc!r}")
+            try:
+                conn.sendall(frame(T_ERROR, 0, 0, encode_error(E_INTERNAL, "internal")))
+            except OSError:
+                pass
+        finally:
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            conn.close()
+
+    def handle(self, conn: socket.socket, peer, number: int) -> None:
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        reader = Reader(conn)
+        served = 0
+        self.log(f"[conn {number}] open from {peer[0]}:{peer[1]}")
+
+        try:
+            if reader.exact(len(PREFACE)) != PREFACE:
+                raise ConnectionError_(E_BAD_PREFACE, "not a BHTTP/1 client")
+
+            while True:
+                head = reader.exact(HEADER_SIZE)
+                length, ftype, flags, stream = parse_frame_header(head)
+
+                if length > MAX_PAYLOAD:
+                    # We cannot skip what we will not read, so the stream
+                    # position is lost and the connection has to go.
+                    raise ConnectionError_(
+                        E_FRAME_TOO_LARGE, f"{length} octets exceeds {MAX_PAYLOAD}")
+
+                payload = reader.exact(length)
+
+                if ftype == T_REQUEST:
+                    if stream == 0 or stream % 2 == 0:
+                        raise ConnectionError_(
+                            E_PROTOCOL, "requests use odd, non-zero stream ids")
+                    served += 1
+                    with self._lock:
+                        self.requests += 1
+                    self.serve_request(conn, payload, stream, number, served)
+
+                elif ftype == T_DATA:
+                    # A body on a request we have already answered. Read and
+                    # drop it; the frame told us how much there was.
+                    self.log(f"[conn {number}] discarded {length} octets of DATA")
+
+                elif ftype == T_PING:
+                    if flags & F_ACK:
+                        continue
+                    if length > MAX_PING:
+                        raise ConnectionError_(E_PROTOCOL, "PING payload too large")
+                    conn.sendall(frame(T_PING, F_ACK, 0, payload))
+
+                elif ftype == T_ERROR:
+                    cur = Cursor(payload)
+                    code = cur.u16()
+                    reason = cur.take(cur.u16()).decode("utf-8", "replace")
+                    self.log(f"[conn {number}] peer sent ERROR {code}: {reason}")
+                    return
+
+                elif ftype == T_RESPONSE:
+                    raise ConnectionError_(E_PROTOCOL, "a client may not send RESPONSE")
+
+                else:
+                    # SPEC 10, the line you may not skip. We have already
+                    # consumed exactly `length` octets, so the next frame
+                    # header is where it should be. Carry on as if nothing
+                    # happened, because from the stream's point of view
+                    # nothing did.
+                    with self._lock:
+                        self.skipped_unknown += 1
+                    self.log(f"[conn {number}] skipped unknown frame type "
+                             f"0x{ftype:02x} ({length} octets)")
+
+        except Gone:
+            self.log(f"[conn {number}] peer closed after {served} request(s)")
+        except ConnectionError_ as err:
+            self.log(f"[conn {number}] connection error {err.code}: {err.reason}")
+            try:
+                conn.sendall(frame(T_ERROR, 0, 0, encode_error(err.code, err.reason)))
+            except OSError:
+                pass
+
+    def serve_request(self, conn: socket.socket, payload: bytes, stream: int,
+                      number: int, served: int) -> None:
+        method = path = "?"
+        try:
+            method, path, fields = decode_request(payload)
+            if method not in ("GET", "HEAD"):
+                raise StreamError(405, f"{method} is not allowed",
+                                  headers=[("allow", "GET, HEAD")])
+
+            filename = resolve(self.root, path)
+            with open(filename, "rb") as handle:
+                body = handle.read()
+            stat = os.stat(filename)
+            extension = os.path.splitext(filename)[1].lower()
+
+            headers = [
+                ("content-type", CONTENT_TYPES.get(extension, "application/octet-stream")),
+                ("content-length", str(len(body))),
+                ("date", http_date()),
+                ("server", SERVER_ID),
+                ("last-modified", http_date(stat.st_mtime)),
+                ("etag", f'"{stat.st_mtime_ns:x}-{len(body):x}"'),
+            ]
+            status = 200
+            if method == "HEAD":
+                body = b""
+
+        except StreamError as err:
+            status = err.status
+            body = f"{err.status} {err.detail}\n".encode("utf-8")
+            headers = [("content-type", "text/plain; charset=utf-8"),
+                       ("content-length", str(len(body))),
+                       ("date", http_date()),
+                       ("server", SERVER_ID)] + list(err.headers)
+
+        response = encode_response(status, headers)
+        if not body:
+            conn.sendall(frame(T_RESPONSE, F_END_MESSAGE, stream, response))
+        else:
+            out = bytearray(frame(T_RESPONSE, 0, stream, response))
+            for start in range(0, len(body), DATA_CHUNK):
+                piece = body[start : start + DATA_CHUNK]
+                last = start + DATA_CHUNK >= len(body)
+                out += frame(T_DATA, F_END_MESSAGE if last else 0, stream, piece)
+            conn.sendall(bytes(out))
+
+        self.log(f"[conn {number}] #{served} stream={stream} {method} {path} "
+                 f"-> {status} ({len(body)} octets)")
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="bserve", description="a BHTTP/1 file server",
+        usage="%(prog)s [root] [port]")
+    parser.add_argument("root", nargs="?", default="./www")
+    parser.add_argument("port", nargs="?", type=int, default=9000)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("-q", "--quiet", action="store_true")
+    args = parser.parse_args(argv)
+
+    if not os.path.isdir(args.root):
+        print(f"bserve: no such directory: {args.root}", file=sys.stderr)
+        return 2
+
+    server = BServe(args.root, args.host, args.port, verbose=not args.quiet)
+    server.listen()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("", file=sys.stderr)
+    finally:
+        server.stop()
+        server.log(f"bserve: {server.connections} connection(s), "
+                   f"{server.requests} request(s), "
+                   f"{server.skipped_unknown} unknown frame(s) skipped")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

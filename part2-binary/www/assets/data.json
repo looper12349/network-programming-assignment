@@ -1,0 +1,6 @@
+{
+  "protocol": "BHTTP/1",
+  "frame_header_octets": 8,
+  "fields": { "length": 24, "type": 8, "flags": 8, "reserved": 1, "stream_id": 23 },
+  "unknown_frame_types": "skipped by length, connection survives"
+}
