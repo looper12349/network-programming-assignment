@@ -1,0 +1,459 @@
+#!/usr/bin/env python3
+"""bcurl - a BHTTP/1 client.
+
+    ./bcurl -v localhost:9000/index.html
+
+Builds the binary request frame, reads the response, writes the body to
+stdout. With -v it hexdumps every frame in both directions, annotated.
+Exits non-zero on 4xx and 5xx.
+
+    ./bcurl localhost:9000/index.html /about.html /assets/data.json
+
+Several URLs, one connection. bcurl never opens a second one: the whole
+point of the protocol is that it does not have to.
+
+This file implements SPEC.md and shares no code with ./bserve. The two
+were written from the document, which is the only thing that crosses
+between them.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import socket
+import sys
+from typing import List, Optional, Tuple
+
+# ---------------------------------------------------------------------------
+# SPEC.md sections 2-6
+# ---------------------------------------------------------------------------
+
+PREFACE = b"BHTTP/1\x00"
+HEADER_SIZE = 8
+
+T_REQUEST, T_RESPONSE, T_DATA, T_ERROR, T_PING = 0x01, 0x02, 0x03, 0x04, 0x05
+F_END_MESSAGE, F_ACK = 0x01, 0x02
+
+TYPE_NAMES = {
+    T_REQUEST: "REQUEST", T_RESPONSE: "RESPONSE", T_DATA: "DATA",
+    T_ERROR: "ERROR", T_PING: "PING",
+}
+ERROR_NAMES = {1: "PROTOCOL_ERROR", 2: "FRAME_TOO_LARGE",
+               3: "BAD_PREFACE", 4: "INTERNAL_ERROR"}
+
+MAX_PAYLOAD = 1024 * 1024
+
+STATIC_NAMES = ["host", "user-agent", "accept", "content-type", "content-length",
+                "date", "server", "connection", "last-modified", "etag"]
+NAME_INDEX = {name: i + 1 for i, name in enumerate(STATIC_NAMES)}
+
+METHOD_CODES = {"GET": 1, "HEAD": 2, "POST": 3, "PUT": 4,
+                "DELETE": 5, "OPTIONS": 6}
+
+CLIENT_ID = "bcurl/1.0"
+
+# exit codes
+EXIT_OK, EXIT_USAGE, EXIT_CONNECT, EXIT_CLIENT_ERROR, EXIT_SERVER_ERROR = 0, 2, 3, 4, 5
+
+DIM, BOLD, CYAN, YELLOW, RED, OFF = (
+    "\033[2m", "\033[1m", "\033[36m", "\033[33m", "\033[31m", "\033[0m")
+
+
+def colour_enabled() -> bool:
+    return sys.stderr.isatty() and os.environ.get("NO_COLOR") is None
+
+
+class ProtocolError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# encoding (SPEC 3, 6, 7.1)
+# ---------------------------------------------------------------------------
+
+
+def u24(value: int) -> bytes:
+    return bytes(((value >> 16) & 0xFF, (value >> 8) & 0xFF, value & 0xFF))
+
+
+def u16(value: int) -> bytes:
+    return bytes(((value >> 8) & 0xFF, value & 0xFF))
+
+
+def frame(ftype: int, flags: int, stream: int, payload: bytes) -> bytes:
+    # Octet 5's top bit is R and we send it 0, which is what makes the
+    # stream id 23 bits wide rather than 24.
+    return (u24(len(payload)) + bytes((ftype, flags))
+            + u24(stream & 0x7FFFFF) + payload)
+
+
+def encode_header_block(fields: List[Tuple[str, str]]) -> bytes:
+    out = bytearray([len(fields)])
+    for name, value in fields:
+        lname = name.lower()
+        index = NAME_INDEX.get(lname, 0)
+        out.append(index)
+        if index == 0:
+            raw = lname.encode("ascii")
+            out.append(len(raw))
+            out += raw
+        raw_value = value.encode("utf-8")
+        out += u16(len(raw_value)) + raw_value
+    return bytes(out)
+
+
+def encode_request(method: str, path: str,
+                   fields: List[Tuple[str, str]]) -> bytes:
+    out = bytearray()
+    code = METHOD_CODES.get(method.upper())
+    if code is None:
+        raw = method.upper().encode("ascii")
+        out.append(0)
+        out.append(len(raw))
+        out += raw
+    else:
+        out.append(code)
+    raw_path = path.encode("utf-8")
+    out += u16(len(raw_path)) + raw_path
+    out += encode_header_block(fields)
+    return bytes(out)
+
+
+# ---------------------------------------------------------------------------
+# decoding (SPEC 3, 6, 7.2)
+# ---------------------------------------------------------------------------
+
+
+class Cursor:
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+        self.pos = 0
+
+    def take(self, n: int) -> bytes:
+        if n < 0 or self.pos + n > len(self.data):
+            raise ProtocolError("frame payload ends inside a field")
+        out = self.data[self.pos : self.pos + n]
+        self.pos += n
+        return out
+
+    def u8(self) -> int:
+        return self.take(1)[0]
+
+    def u16(self) -> int:
+        b = self.take(2)
+        return (b[0] << 8) | b[1]
+
+
+def decode_header_block(cur: Cursor) -> List[Tuple[str, str]]:
+    count = cur.u8()
+    fields = []
+    for _ in range(count):
+        ref = cur.u8()
+        if ref == 0:
+            name = cur.take(cur.u8()).decode("ascii", "replace")
+        elif 1 <= ref <= len(STATIC_NAMES):
+            name = STATIC_NAMES[ref - 1]
+        else:
+            raise ProtocolError(f"unknown static header index {ref}")
+        value = cur.take(cur.u16()).decode("utf-8", "replace")
+        fields.append((name, value))
+    return fields
+
+
+class Connection:
+    """One TCP connection, opened once, reused for every request."""
+
+    def __init__(self, host: str, port: int, *, verbose: bool = False,
+                 timeout: float = 10.0) -> None:
+        self.host = host
+        self.port = port
+        self.verbose = verbose
+        self.colour = colour_enabled()
+        self.sock = socket.create_connection((host, port), timeout=timeout)
+        self.buf = bytearray()
+        self.next_stream = 1
+        self.skipped_unknown = 0
+        self.trace(f"connected to {host}:{port}", "*")
+        self.send_raw(PREFACE, label="connection preface")
+
+    # -- wire -------------------------------------------------------------
+
+    def paint(self, text: str, colour: str) -> str:
+        return f"{colour}{text}{OFF}" if self.colour else text
+
+    def trace(self, message: str, marker: str = "*") -> None:
+        if self.verbose:
+            print(f"{marker} {message}", file=sys.stderr)
+
+    def hexdump(self, data: bytes, marker: str) -> None:
+        if not self.verbose:
+            return
+        for offset in range(0, len(data), 16):
+            chunk = data[offset : offset + 16]
+            hexes = " ".join(f"{b:02x}" for b in chunk)
+            if len(chunk) > 8:
+                hexes = hexes[:23] + " " + hexes[23:]
+            text = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+            print(f"{marker} {self.paint(f'{offset:04x}', DIM)}  {hexes:<49} "
+                  f"{self.paint('|' + text + '|', DIM)}", file=sys.stderr)
+
+    def send_raw(self, data: bytes, label: str) -> None:
+        self.trace(self.paint(label, CYAN), ">")
+        self.hexdump(data, ">")
+        self.sock.sendall(data)
+
+    def send_frame(self, ftype: int, flags: int, stream: int,
+                   payload: bytes) -> None:
+        raw = frame(ftype, flags, stream, payload)
+        self.trace(self.paint(
+            f"{TYPE_NAMES.get(ftype, f'0x{ftype:02x}')} "
+            f"stream={stream} flags={describe_flags(ftype, flags)} "
+            f"len={len(payload)}", CYAN), ">")
+        self.hexdump(raw, ">")
+        self.sock.sendall(raw)
+
+    def recv_exact(self, n: int) -> bytes:
+        while len(self.buf) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise ProtocolError("server closed the connection")
+            self.buf += chunk
+        out = bytes(self.buf[:n])
+        del self.buf[:n]
+        return out
+
+    def read_frame(self) -> Tuple[int, int, int, bytes]:
+        head = self.recv_exact(HEADER_SIZE)
+        length = (head[0] << 16) | (head[1] << 8) | head[2]
+        ftype, flags = head[3], head[4]
+        stream = ((head[5] & 0x7F) << 16) | (head[6] << 8) | head[7]
+        if length > MAX_PAYLOAD:
+            raise ProtocolError(f"frame announces {length} octets")
+        payload = self.recv_exact(length)
+        self.trace(self.paint(
+            f"{TYPE_NAMES.get(ftype, f'unknown 0x{ftype:02x}')} "
+            f"stream={stream} flags={describe_flags(ftype, flags)} "
+            f"len={length}", YELLOW), "<")
+        self.hexdump(head + payload, "<")
+        return ftype, flags, stream, payload
+
+    # -- messages ---------------------------------------------------------
+
+    def request(self, method: str, path: str, authority: str
+                ) -> Tuple[int, List[Tuple[str, str]], bytes]:
+        stream = self.next_stream
+        self.next_stream += 2  # SPEC 8.2: odd, increasing, never reused
+
+        fields = [("host", authority), ("user-agent", CLIENT_ID),
+                  ("accept", "*/*")]
+        self.send_frame(T_REQUEST, F_END_MESSAGE, stream,
+                        encode_request(method, path, fields))
+
+        status: Optional[int] = None
+        headers: List[Tuple[str, str]] = []
+        body = bytearray()
+
+        while True:
+            ftype, flags, frame_stream, payload = self.read_frame()
+
+            if ftype == T_ERROR:
+                cur = Cursor(payload)
+                code = cur.u16()
+                reason = cur.take(cur.u16()).decode("utf-8", "replace")
+                raise ProtocolError(
+                    f"server sent ERROR {ERROR_NAMES.get(code, code)}: {reason}")
+
+            if ftype == T_PING:
+                if not flags & F_ACK:
+                    self.send_frame(T_PING, F_ACK, 0, payload)
+                continue
+
+            if ftype not in (T_RESPONSE, T_DATA):
+                # SPEC 10. We already consumed exactly `length` octets, so
+                # the next header is where it should be. Step over it.
+                self.skipped_unknown += 1
+                self.trace(self.paint(
+                    f"unknown frame type 0x{ftype:02x}, skipped "
+                    f"{len(payload)} octets by length", DIM), "<")
+                continue
+
+            if frame_stream != stream:
+                raise ProtocolError(
+                    f"response on stream {frame_stream}, expected {stream}")
+
+            if ftype == T_RESPONSE:
+                if status is not None:
+                    raise ProtocolError("two RESPONSE frames on one stream")
+                cur = Cursor(payload)
+                status = cur.u16()
+                headers = decode_header_block(cur)
+            else:
+                body += payload
+
+            if flags & F_END_MESSAGE:
+                break
+
+        if status is None:
+            raise ProtocolError("message ended without a RESPONSE frame")
+
+        # SPEC 8.6: the frames are authoritative. content-length is checked
+        # against them and reported, never used to decide where the body ends.
+        declared = dict((k.lower(), v) for k, v in headers).get("content-length")
+        if declared is not None and declared.isdigit() and int(declared) != len(body):
+            self.trace(self.paint(
+                f"content-length says {declared}, frames carried {len(body)}; "
+                f"trusting the frames", RED), "!")
+
+        return status, headers, bytes(body)
+
+    def ping(self, payload: bytes = b"bcurl") -> bool:
+        self.send_frame(T_PING, 0, 0, payload)
+        while True:
+            ftype, flags, _, echoed = self.read_frame()
+            if ftype == T_PING and flags & F_ACK:
+                return echoed == payload
+
+    def send_unknown(self, ftype: int = 0x7F,
+                     payload: bytes = b"a frame from the future") -> None:
+        """Deliberately send a frame type this version does not define.
+
+        SPEC 10 says the server must read and discard exactly Length octets
+        and carry on. If it does not, the next request on this connection
+        will be parsed from the middle of this payload and everything after
+        it is nonsense - which is exactly what the test looks for.
+        """
+        self.send_frame(ftype, 0, 0, payload)
+
+    def close(self) -> None:
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self.sock.close()
+
+
+def describe_flags(ftype: int, flags: int) -> str:
+    names = []
+    if flags & F_END_MESSAGE and ftype in (T_REQUEST, T_RESPONSE, T_DATA):
+        names.append("END_MESSAGE")
+    if flags & F_ACK and ftype == T_PING:
+        names.append("ACK")
+    leftover = flags & ~(F_END_MESSAGE | F_ACK)
+    if leftover:
+        names.append(f"reserved=0x{leftover:02x}")
+    return "|".join(names) if names else "-"
+
+
+# ---------------------------------------------------------------------------
+# command line
+# ---------------------------------------------------------------------------
+
+
+def split_url(raw: str, fallback: Optional[Tuple[str, int]]
+              ) -> Tuple[str, int, str]:
+    url = raw
+    for scheme in ("bhttp://", "http://"):
+        if url.startswith(scheme):
+            url = url[len(scheme):]
+            break
+
+    if url.startswith("/"):
+        if fallback is None:
+            raise ValueError(f"no host in {raw!r} and no earlier URL to borrow one from")
+        return fallback[0], fallback[1], url
+
+    authority, slash, path = url.partition("/")
+    path = "/" + path if slash else "/"
+    host, colon, port = authority.partition(":")
+    if not host:
+        raise ValueError(f"no host in {raw!r}")
+    if colon and not port.isdigit():
+        raise ValueError(f"bad port in {raw!r}")
+    return host, int(port) if colon else 9000, path
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="bcurl", description="a BHTTP/1 client",
+        epilog="Several URLs are fetched over one connection, in order.")
+    parser.add_argument("urls", nargs="+", metavar="URL",
+                        help="host:port/path, or /path to reuse the last host")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="hexdump every frame in both directions")
+    parser.add_argument("-X", "--method", default="GET")
+    parser.add_argument("-o", "--output", help="write the body to a file")
+    parser.add_argument("-I", "--head", action="store_true",
+                        help="send HEAD and print headers only")
+    parser.add_argument("--ping", action="store_true",
+                        help="send a PING before the request")
+    parser.add_argument("--send-unknown", action="store_true",
+                        help="send an undefined frame type first; the server "
+                             "must skip it and answer anyway (SPEC 10)")
+    parser.add_argument("--timeout", type=float, default=10.0)
+    args = parser.parse_args(argv)
+
+    method = "HEAD" if args.head else args.method.upper()
+
+    try:
+        host, port, first_path = split_url(args.urls[0], None)
+    except ValueError as exc:
+        print(f"bcurl: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+
+    try:
+        conn = Connection(host, port, verbose=args.verbose, timeout=args.timeout)
+    except OSError as exc:
+        print(f"bcurl: cannot connect to {host}:{port}: {exc}", file=sys.stderr)
+        return EXIT_CONNECT
+
+    authority = f"{host}:{port}"
+    worst = EXIT_OK
+    out = open(args.output, "wb") if args.output else None
+
+    try:
+        if args.ping:
+            conn.trace("PING" + (" acknowledged" if conn.ping() else " MISMATCH"), "*")
+        if args.send_unknown:
+            conn.send_unknown()
+
+        paths = [first_path]
+        for raw in args.urls[1:]:
+            paths.append(split_url(raw, (host, port))[2])
+
+        for path in paths:
+            status, headers, body = conn.request(method, path, authority)
+
+            if args.verbose or args.head:
+                print(f"< {status}", file=sys.stderr)
+                for name, value in headers:
+                    print(f"< {name}: {value}", file=sys.stderr)
+
+            if not args.head:
+                target = out or sys.stdout.buffer
+                target.write(body)
+                target.flush()
+
+            if 400 <= status < 500:
+                worst = max(worst, EXIT_CLIENT_ERROR)
+            elif status >= 500:
+                worst = max(worst, EXIT_SERVER_ERROR)
+
+        conn.trace(f"1 TCP handshake, {len(paths)} request(s), "
+                   f"{conn.skipped_unknown} unknown frame(s) skipped", "*")
+    except ProtocolError as exc:
+        print(f"bcurl: {exc}", file=sys.stderr)
+        return EXIT_CONNECT
+    except OSError as exc:
+        print(f"bcurl: {exc}", file=sys.stderr)
+        return EXIT_CONNECT
+    finally:
+        if out is not None:
+            out.close()
+        conn.close()
+
+    return worst
+
+
+if __name__ == "__main__":
+    sys.exit(main())
